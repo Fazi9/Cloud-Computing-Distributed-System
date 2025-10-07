@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless Data Pipeline for Social Media Trend Analysis
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: SocialMediaPipeline
+
+Resources:
+  # --- S3 STORAGE LAYER (DATA LAKE) ---
+  RawDataBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      # Bucket names must be globally unique. Using AWS Account ID ensures uniqueness.
+      BucketName: !Sub "socialmediapipeline-raw-data-${AWS::AccountId}" 
+      Tags:
+        - Key: DataTier
+          Value: Raw
+      
+      # V V V V V ADD THIS SECTION V V V V V
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt ProcessingQueue.Arn
+      # ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ 
+
+  CuratedDataBucket:
+      Type: 'AWS::S3::Bucket'
+      Properties:
+        # Use a fully lowercase, unique name for the bucket
+        # NOTE: This replaces the capitalized ProjectName variable with 'socialmediapipeline'
+        BucketName: !Sub "socialmediapipeline-curated-data-${AWS::AccountId}" 
+        Tags:
+          - Key: DataTier
+            Value: Curated
+
+  # --- MESSAGING LAYER (SCALABILITY & FAULT-TOLERANCE) ---
+  ProcessingQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub "${ProjectName}-ProcessingQueue"
+      VisibilityTimeout: 300
+
+  ProcessingQueuePolicy:
+    Type: 'AWS::SQS::QueuePolicy'
+    Properties:
+      Queues:
+        - !Ref ProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt ProcessingQueue.Arn
+            Condition:
+              # This is the most reliable structure for S3-to-SQS within the same account/region.
+              ArnLike:
+                # We are using the exact, lowercase name of the bucket in the ARN format.
+                'aws:SourceArn': !Sub 'arn:aws:s3:::socialmediapipeline-raw-data-${AWS::AccountId}'
+
+  # --- COMPUTE LAYER (AWS LAMBDA) ---
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole' # Allows Lambda to poll SQS
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::${RawDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${CuratedDataBucket}/*'
+        - PolicyName: LambdaLoggingPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  DataProcessorLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: sentiment_handler.handler 
+      Runtime: python3.11
+      Timeout: 180 
+      MemorySize: 2048
+      Role: !GetAtt LambdaExecutionRole.Arn
+      # IMPORTANT: CodeUri is required but we'll update the code AFTER deployment
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, context):
+              print("Initial stub code. Deploying actual code soon.")
+              return {'statusCode': 200, 'body': json.dumps('OK')}
+      Environment:
+        Variables:
+          CURATED_BUCKET_NAME: !Ref CuratedDataBucket
+
+  # --- SCALING CONFIGURATION (SQS to Lambda Trigger) ---
+  LambdaEventSourceMapping:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    Properties:
+      EventSourceArn: !GetAtt ProcessingQueue.Arn
+      FunctionName: !Ref DataProcessorLambda
+      BatchSize: 10 
+      Enabled: true
+
+# --- OUTPUTS (For easy access to resources) ---
+Outputs:
+  RawBucketName:
+    Description: S3 Bucket for Raw Data Ingestion
+    Value: !Ref RawDataBucket
+  CuratedBucketName:
+    Description: S3 Bucket for Curated, Processed Data
+    Value: !Ref CuratedDataBucket
